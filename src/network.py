@@ -1,6 +1,7 @@
 import torchvision.models as models
 import torch.nn as nn
 import torch
+import timm
 import config
 
 device = torch.device('cuda:0')
@@ -59,6 +60,7 @@ class Resnet18(nn.Module):
         x = self.softmax(x)
         return x
 
+
 def make_model(name,n_per_unit):
     if name == 'Vgg16':
         net = Vgg16()
@@ -72,4 +74,6 @@ def make_model(name,n_per_unit):
         net = Resnet18().to(device)
     elif name == 'ResNet34':
         net = Resnet34().to(device)
+    elif name =='ViT':
+        net = timm.create_model('vit_base_patch16_224_in21k',num_classes=config.n_class,in_chans=1).to(device)
     return net

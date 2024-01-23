@@ -30,6 +30,27 @@ TypeToIntdict = {'age':3,'gender':4,'N':5,'C':7,'P':8}
 torch.backends.cudnn.benchmark = True
 device = torch.device('cuda:0')
 
+class Subset_label(Dataset):
+    """
+    Subset of a dataset at specified indices.
+
+    Arguments:
+        dataset (Dataset): The whole Dataset
+        indices (sequence): Indices in the whole set selected for subset
+    """
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = indices
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def pick_label(self,idx):
+        return self.dataset.pick_label(self.indices[idx])
+
 def write_LogHeader(log_path):
     #CSVファイルのヘッダー記述
     with open(log_path + "/log.csv",'w') as f:
@@ -51,18 +72,37 @@ def plot_Loss(dir_path,lossList,lr,preprocess):
         plt.legend()
         plt.savefig(os.path.join(dir_path,'Loss_') + '{:%y%m%d-%H:%M}'.format(datetime.now()) + '.png')
 
-def calc_class_inverse_weight(dataset):
-    #各クラス数をカウントする / 逆数の場合
-    class_count = [202,451]
+def calc_class_count(dataset,n_class):
+    #データセットからラベルの値を一つずつ取り出して、クラス数を計算する
+    class_count = [0] * n_class 
+    l = len(dataset)
+
+    start_time = time.time()
+    for i in range(l):
+        if all(torch.argmax(dataset.pick_label(i)) == torch.Tensor([1])):
+            label = 1
+        else :
+            label = 0
+        class_count[label] += 1
+
+    end_time = time.time()
+    print(class_count)
+
+    return class_count
+
+def calc_class_inverse_weight(dataset,n_class):
+    #逆数の場合の重み付け
+    class_count = calc_class_count(dataset,n_class)
     class_weight = [torch.Tensor([n**(-1) * sum(class_count)]) for n in class_count]
 
     print(class_weight)
     return torch.Tensor(class_weight)
 
-def calc_class_weight(dataset,beta):
-    class_count = [202,451]
+def calc_class_weight(dataset,n_class,beta):
+    #Class Balanced Lossによる重み付け
+    class_count = calc_class_count(dataset,n_class)
     if beta == -1:
-        return calc_class_inverse_weight(dataset)
+        return calc_class_inverse_weight(dataset,n_class)
     elif beta == 0:
         class_weight = [torch.Tensor([1]) for n in range(config.n_class)]
         print(class_weight)
@@ -107,7 +147,15 @@ class Trainer():
             self.net = nn.DataParallel(self.net)
             
             #訓練、検証に分けてデータ分割
-            self.dataset = load_dataset(self.c['n_per_unit'],self.c['type'],self.c['preprocess'])
+            if os.path.exists(config.normal_pkl):
+                with open(config.normal_pkl,mode="rb") as f:
+                    self.dataset = pickle.load(f)
+            else :
+                self.dataset = load_dataset(self.c['n_per_unit'],self.c['type'],self.c['preprocess'])
+                with open(config.normal_pkl,mode="wb") as f:
+                    pickle.dump(self.dataset,f)
+
+
             kf = StratifiedKFold(n_splits=self.n_splits,shuffle=True,random_state=0)
             train_id_index,y = calc_kfold_criterion('train')
 
@@ -122,34 +170,35 @@ class Trainer():
 
             #learning_id_index , valid_id_index = kf.split(train_id_index,y).__next__() 1つだけ取り出したいとき
             for a,(learning_id_index,valid_id_index) in enumerate(id_index):
+
+                start_time = time.time()
                 self.net.apply(init_weights)
                 self.optimizer = optim.SGD(params=self.net.parameters(),lr=self.c['lr'],momentum=0.9)
 
                 #画像に対応したIDに変換 -> Dataloaderで読み込む。
                 learning_index,valid_index = calc_dataset_index(learning_id_index,valid_id_index,'train',self.c['n_per_unit'])
-                learning_dataset = Subset(self.dataset['train'],learning_index)
+                learning_dataset = Subset_label(self.dataset['train'],learning_index)
 
-                #self.class_weight = calc_class_inverse_weight(learning_dataset)
-                self.class_weight = calc_class_weight(learning_dataset,beta=self.c['beta'])
+                self.class_weight = calc_class_weight(learning_dataset,config.n_class,beta=self.c['beta'])
                 #self.criterion = nn.BCELoss(weight=self.class_weight.to(device))
                 self.criterion = Focal_MultiLabel_Loss(gamma=self.c['gamma'],weights=self.class_weight.to(device))
-
 
                 #Dataloaderの種類を指定
                 if self.c['sampler'] == 'normal':
                     self.dataloaders['learning'] = DataLoader(learning_dataset,self.c['bs'],num_workers=os.cpu_count(),shuffle=True)
+                    #self.dataloaders['learning'] = NormalSampler(learning_dataset,self.c['bs'],shuffle=True)
                 elif self.c['sampler'] == 'over':
-                    self.dataloaders['learning'] = BinaryOverSampler(learning_dataset,self.c['bs']//2)
+                    self.dataloaders['learning'] = BinaryOverSampler(learning_dataset,self.c['bs']//config.n_class)
                 elif self.c['sampler'] == 'under':
-                    self.dataloaders['learning'] = BinaryUnderSampler(learning_dataset,self.c['bs']//2)
+                    self.dataloaders['learning'] = BinaryUnderSampler(learning_dataset,self.c['bs']//config.n_class)
 
                 if not self.c['evaluate']:
-                    valid_dataset = Subset(self.dataset['train'],valid_index)
+                    valid_dataset = Subset_label(self.dataset['train'],valid_index)
                     #検証データに対するSamplerは普通のを採用すればいいから実装する必要がない
                     self.dataloaders['valid'] = DataLoader(valid_dataset,self.c['bs'],
                     shuffle=True,num_workers=os.cpu_count())
 
-                self.earlystopping = EarlyStopping(patience=10,verbose=False,delta=0)
+                #self.earlystopping = EarlyStopping(patience=10,verbose=False,delta=0)
 
                 for epoch in range(1, self.c['n_epoch']+1):
                     learningauc,learningloss,learningprecision,learningrecall \
@@ -161,12 +210,12 @@ class Trainer():
                         valid_pr_auc,validloss,validprecision,validrecall \
                             = self.execute_epoch(epoch, 'valid')
 
-                        self.earlystopping(valid_pr_auc,self.net,epoch)
+                        #self.earlystopping(valid_pr_auc,self.net,epoch)
                         #ストップフラグがTrueの場合、breakでforループを抜ける
-                        if self.earlystopping.early_stop:
-                            print("Early Stopping!")
-                            print('Stop epoch :', epoch)
-                            break
+                        #if self.earlystopping.early_stop:
+                        #    print("Early Stopping!")
+                        #    print('Stop epoch :', epoch)
+                        #    break
 
 
                         lossList['valid'][a].append(validloss)
@@ -279,21 +328,22 @@ class Trainer():
             roc_auc = 0
 
 
-        threshold = 0.5
-        preds[preds > threshold] = 1
-        preds[preds <= threshold] = 0
-
-        preds = np.argmax(preds,axis=1)
+        temp_class = np.arange(config.n_class)
+        preds = np.sum(preds*temp_class,axis=1)
         labels = np.argmax(labels,axis=1)
 
-        total_loss /= len(preds)
-        recall = recall_score(labels,preds)
-        precision = precision_score(labels,preds)
         precisions, recalls, thresholds = precision_recall_curve(labels, preds)
         try:
             pr_auc = auc(recalls, precisions)
         except:
             pr_auc = 0
+        
+        preds = np.array([round(x) for x in preds])
+
+
+        total_loss /= len(preds)
+        recall = recall_score(labels,preds)
+        precision = precision_score(labels,preds)
         f1 = f1_score(labels,preds)
         confusion_Matrix = confusion_matrix(labels,preds)
         try:
